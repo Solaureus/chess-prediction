@@ -1,0 +1,625 @@
+---
+title: "Predicting Chess Game Outcomes With The First 20 Moves"
+subtitle: "PSTAT 131 Final Project"
+author: "Sol Kim"
+output:
+    html_document:
+      toc: true
+      toc_float: true
+      code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE,
+                      warning = FALSE)
+```
+
+# Introduction
+
+The main research question of this project is whether we can predict the outcomes of chess matches (whether the player with the black or white pieces won), using only the first 20 moves of the match. There exist already deep learning neural network models which are extremely good at evaluating winning odds for either player from any position. The goal of this project, however, is to explore whether popular and relatively accessible machine learning models such as random forests and boosted trees can be reasonable predictors of chess outcomes with **only** chess move text encodings and no other exogenous information such as player rating.
+
+## Subject Background
+
+![](board.png)
+
+Chess is a zero-sum game with two players, who play on an 8x8 grid of squares (board) with white and black pieces respectively. Each player gets 8 pawns, 2 rooks, 2 knights, 2 bishops, a queen, and a king, and takes turns moving their pieces, which move in unique ways depending on their piece identity. White makes the first move and the two players alternate from there. Pieces can attack one another, removing the enemy piece from the game and taking their spot on the board. The goal of chess is to attack the enemy's king in such a way that they have no means of survival on their next move, otherwise known as a checkmate.
+
+### Encoding
+
+As chess is a game with discrete time steps and relatively simple rules, it can be encoded entirely with text information. A PGN (portable game notation), which we will be transforming into our dataset, is a text format which essentially records the series of moves taken by players throughout the course of a game. Here is a short example of a full game of chess encoded in this way.
+
+1.  e4 e5
+
+2.  Bc4 Bc5
+
+3.  Qh5 Nf6
+
+4.  Qxf7#
+
+![](scholarsmate.gif)
+
+1.  e4: White makes the first move and pushes their pawn to the e4 square, 5 columns to the right (a, b, c, d, then e) and 4 rows up from their perspective.
+
+    e5: Black replies by pushing their pawn to the e5 square.
+
+2.  Bc4: White moves their bishop (notated by B) to c4.
+
+    Bc5: Black moves their bishop to c5.
+
+3.  Qh5: White moves their queen (notated by Q) to h5.
+
+    Nf6: Black moves their knight (N) to f6.
+
+4.  White uses their queen (Q) to take/attack (x) the pawn on f7, simultaneously delivering checkmate (\#). The black king has no legal squares to move and cannot take the white queen, because if it does, it will be taken by the bishop.
+
+*(As a fun aside, this is known as the Scholar's mate because it is one of the quickest ways to get checkmated as a beginner learning chess. A version of this was featured in the popular Netflix show "The Queen's Gambit.)*
+
+Here are a few things to note about PGN and chess parlance:
+
+-   Every piece is notated with a distinct letter but the pawn. (It is e5, not Pe5).
+
+-   A full move in chess is formally considered white's move and then black's move. To avoid the confusion, **a single move made by white or black is known as a ply.** We will be using this terminology in our dataset going forward.
+
+-   Some of the piece actions are represented as such:
+
+    -   'x' notates taking/capturing a piece
+
+    -   'O-O' and 'O-O-O' notate short and long castling, a special move which simultaneously activates the rook and protects the king
+
+    -   '+' notates checking (attacking) the king, forcing a defensive action
+
+    -   '=' notates pawn promotion to a superior piece.
+
+    -   '\#' notates checkmate.
+
+## Data
+
+Our data is a sample of chess games played on lichess.com in February 2016. It is a dataframe with 86,528 rows and 41 columns, where each row represents a unique chess game. The first 40 columns of the dataset represent the first 20 moves (**40 ply,** white's 'move' and black's 'move') of the game (games which ended before the first 20 moves were removed from the dataset. **Therefore, this dataframe contains no missing data**). The last column is the result column, a binary variable representing white's (1) or black's (0) victory.
+
+To obtain this data, we first started with a .pgn file which contains millions of games from <https://database.lichess.org/#standard_games>. Then we split this .pgn file into a manageable number of games, and used a Python script to convert the raw text data into the dataframe we desire.
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(janitor)
+library(magrittr)
+library(ggplot2)
+library(tidymodels)
+library(corrplot)
+library(vip)
+library(knitr)
+library(kableExtra)
+```
+
+```{r}
+initial_data <- read_csv('data.csv') # data from lichess, extracted from python script
+clean_data <- clean_names(initial_data) # tidy names
+filtered_data <- filter(clean_data, !(is.na(result))) # remove games with less than 20 full moves
+filtered_data %<>% filter(result != '1/2-1/2') # remove games which end in a draw
+filtered_data$result %<>% case_match('1-0' ~ 1, '0-1' ~ 0)
+data <- filtered_data
+
+rm(clean_data, filtered_data, initial_data)
+```
+
+We cleaned the data column names, and removed many of the special characters in the existing notation with the actual words the symbols represent to avoid any problems down the road with text processing by the computer. We also removed games which ended in a draw, a relatively rare outcome in chess and not one of particular interest to our analysis.
+
+```{r}
+checks <- data.frame(apply(data[1:41], 2, function(x) gsub("\\+", "check", x)))
+castle <- data.frame(apply(checks[1:41], 2, function(x) gsub("\\-", "castle", x)))
+promote <- data.frame(apply(castle[1:41], 2, function(x) gsub("\\=", "promote", x)))
+takes <- data.frame(apply(promote[1:41], 2, function(x) gsub("x", "takes", x)))
+data <- data.frame(apply(takes[1:41], 2, function(x) gsub("\\#", "mate", x)))
+data <- data.frame(lapply(data, factor)) # factorize
+
+rm(checks, castle, promote, takes)
+kable(data[1:5, ]) %>%  kable_styling(full_width = F) %>% 
+  scroll_box(width = "100%", height = "200px")
+```
+
+# Exploratory Data Analysis
+
+Before attempting to fit any models to data, it is always advisable to try and understand the data on a descriptive basis. That will be the aim of this section.
+
+## Missingness
+
+```{r}
+sum(is.na(data)) # no missing values
+```
+
+As was discussed previously, there are no missing values in the dataset because we wanted to include only those games which had at least 20 full moves for us to use to predict the result.
+
+## Distribution of the outcome variable (white or black victory)
+
+```{r echo=FALSE}
+data %>% ggplot(aes(x=fct_infreq(result), fill=result, y = (..count..)/sum(..count..))) + geom_bar() +
+  scale_fill_manual(values = c("black", "white")) +
+  theme(legend.position = "none") +
+  ylab("Proportion of wins") +
+  xlab("") +
+  scale_x_discrete(labels=c('White','Black'))# relative proportion of outcome
+```
+
+This is the proportion of our response variable, whether white or black won. We see that over the whole dataset, white has won slightly more matches than black, but that the response is fairly evenly distributed between the two outcomes. This aligns with common knowledge regarding chess; white is considered to have only a slight advantage over black and we should expect to see this distribution.
+
+## Analysis of the first few moves of a game
+
+Chess is a game which grows increasingly complex as players take more moves. This is because every chess game begins from the same position, but even minor novelties in moves chosen by any two given players can quickly produce a game which has never been played before.
+
+Here we are interested in answering the question, **"As players make more moves, what proportion of the games become entirely unique in the dataset?"**
+
+We accomplish this by grouping the individual 'ply' strings together. E.g., we group the first two ply of every game and make a vector containing the first "full move" for every game in the dataset. We do the same for the first three ply (first one and a half moves) and first four ply (first full two moves) and many more to capture this relationship.
+
+```{r echo=FALSE}
+two_ply <- fct_infreq(apply(data[1:2], 1, function(row) paste(row, collapse = " ")))
+three_ply <- fct_infreq(apply(data[1:3], 1, function(row) paste(row, collapse = " ")))
+four_ply <- fct_infreq(apply(data[1:4], 1, function(row) paste(row, collapse = " ")))
+five_ply <- fct_infreq(apply(data[1:5], 1, function(row) paste(row, collapse = " ")))
+six_ply <- fct_infreq(apply(data[1:6], 1, function(row) paste(row, collapse = " ")))
+seven_ply <- fct_infreq(apply(data[1:7], 1, function(row) paste(row, collapse = " ")))
+eight_ply <- fct_infreq(apply(data[1:8], 1, function(row) paste(row, collapse = " ")))
+ten_ply <- fct_infreq(apply(data[1:10], 1, function(row) paste(row, collapse = " ")))
+sixteen_ply <- fct_infreq(apply(data[1:15], 1, function(row) paste(row, collapse = " ")))
+twenty_ply <- fct_infreq(apply(data[1:20], 1, function(row) paste(row, collapse = " ")))
+thirty_ply <- fct_infreq(apply(data[1:30], 1, function(row) paste(row, collapse = " ")))
+forty_ply <- fct_infreq(apply(data[1:40], 1, function(row) paste(row, collapse = " ")))
+```
+
+```{r echo=FALSE}
+unique_games <- c(length(unique(two_ply)),
+length(unique(three_ply)),
+length(unique(four_ply)),
+length(unique(five_ply)),
+length(unique(six_ply)),
+length(unique(seven_ply)),
+length(unique(eight_ply)),
+length(unique(ten_ply)),
+length(unique(sixteen_ply)),
+length(unique(forty_ply)))
+
+ply_amount <- c('Move 1', 'Move 1.5', 'Move 2', 'Move 2.5', 'Move 3', 'Move 3.5', 'Move 4', 'Move 5', 'Move 8', 'Move 20')
+
+unique_games_by_move <- data.frame(ply_amount, unique_games)
+
+unique_games_by_move %>% 
+  ggplot(aes(x = reorder(ply_amount, unique_games), fill = unique_games,
+             y = unique_games)) +
+  geom_bar(stat = 'identity') +
+  geom_text(aes(label = unique_games), vjust = -0.5) +
+  xlab("Number of full moves (ply/2)") +
+  ylab("Number of unique games") +
+  theme_minimal() +
+  ggtitle("Number of unique games over move number") +
+  theme(legend.position = "none")
+```
+
+First note that the x-axis is non-linear after move 4. This is to conserve space, the major point is made within the first 4 moves- games become very unique, very quickly. Of 86,528 games, there are **only 280 unique opening plys by white.** The games become rapidly unique thereafter. This also demonstrates to us the challenge of predicting chess outcomes as chess is a highly complex game.
+
+## What are the first moves being played? What are there relative proportions?
+
+```{r include=FALSE}
+two_ply_freqs <- data.frame(table(two_ply))
+two_ply_props <- two_ply_freqs %>% mutate(prop = Freq/nrow(data))
+two_ply_props %<>% filter(prop > .01)
+two_ply_props
+```
+
+```{r echo=FALSE}
+two_ply_props %>% 
+  ggplot(aes(x = two_ply, fill = two_ply,
+             y = prop)) + 
+  geom_bar(stat = 'identity') +
+  xlab("Move") +
+  ylab("Proportion of first moves over all games") +
+  ggtitle("Relative proportions of opening first move") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r include=FALSE}
+four_ply_freqs <- data.frame(table(four_ply))
+four_ply_props <- four_ply_freqs %>% mutate(prop = Freq/nrow(data))
+four_ply_props %<>% filter(prop > .007)
+four_ply_props
+```
+
+```{r echo=FALSE}
+four_ply_props %>% 
+  ggplot(aes(x = four_ply, fill = four_ply,
+             y = prop)) + 
+  geom_bar(stat = 'identity', position = 'dodge') +
+  scale_x_discrete(guide=guide_axis(n.dodge=3)) +
+  xlab("Opening two moves") +
+  ylab("Proportion of moves 1, 2 over all games") +
+  ggtitle("Relative proportions of opening two moves") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r include=FALSE}
+six_ply_freqs <- data.frame(table(six_ply))
+six_ply_props <- six_ply_freqs %>% mutate(prop = Freq/nrow(data))
+six_ply_props %<>% filter(prop > .004)
+six_ply_props
+```
+
+```{r echo=FALSE}
+six_ply_props %>% 
+  ggplot(aes(x = six_ply, fill = six_ply,
+             y = prop)) + 
+  geom_bar(stat = 'identity', position = 'dodge') +
+  scale_x_discrete(guide=guide_axis(n.dodge=5)) +
+  xlab("Opening three moves") +
+  ylab("Proportion of moves 1, 2, 3 over all games") +
+  ggtitle("Relative proportions of opening three moves") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Note that to maintain a similar number of moves displayed on each graph (as we go from 1 to 2 to 3 full moves), we have had to set the minimum relative proportion of moves played lower and lower.
+
+Simply, this means as we go from 1 to 2 to 3 full moves, particular "favorite" openings stand out less as taking up a large proportion of the moves that are being played. Instead, there are more opening moves which each account for a smaller proportion of the moves that are being played.
+
+## Can special moves tell us anything about the outcome?
+
+We can find special moves (such as check, castle, and promote) because they are notated differently than other moves. For reference, these terms were defined in the 'Encoding' section of the introduction.
+
+We will look at the result of games where white delivered check, castled, or promoted within the first 20 moves versus the games where white did not and observe if there is a difference.
+
+```{r echo=FALSE}
+white_moves <- data %>% select(ply_1, ply_3, ply_5, ply_7, ply_9,
+                ply_11, ply_13, ply_15, ply_17, ply_19,
+                ply_21, ply_23, ply_25, ply_27, ply_29,
+                ply_31, ply_33, ply_35, ply_37, ply_39, result)
+
+black_moves <- data %>% select(ply_2, ply_4, ply_6, ply_8, ply_10,
+                ply_12, ply_14, ply_16, ply_18, ply_20,
+                ply_22, ply_24, ply_26, ply_28, ply_30,
+                ply_32, ply_34, ply_36, ply_38, ply_40, result)
+
+
+white_moves$check <- apply(white_moves, 1, function(row) any(grepl('check', row)))
+white_moves$castle <- apply(white_moves, 1, function(row) any(grepl('castle', row)))
+white_moves$promote <- apply(white_moves, 1, function(row) any(grepl('promote', row)))
+did_white <- white_moves %>% select(check, castle, promote, result)
+
+black_moves$check <- apply(black_moves, 1, function(row) any(grepl('check', row)))
+black_moves$castle <- apply(black_moves, 1, function(row) any(grepl('castle', row)))
+black_moves$promote <- apply(black_moves, 1, function(row) any(grepl('promote', row)))
+did_black <- black_moves %>% select(check, castle, promote, result)
+
+white_check_prop <- did_white %>% filter(check == TRUE) %>% select(check, result) %>%
+  table() %>% data.frame() %>% mutate(proportion = Freq/sum(Freq))
+
+white_no_check_prop <- did_white %>% filter(check == FALSE) %>% select(check, result) %>%
+  table() %>% data.frame() %>% mutate(proportion = Freq/sum(Freq))
+
+white_castle_prop <- did_white %>% filter(castle == TRUE) %>% select(castle, result) %>%
+  table() %>% data.frame() %>% mutate(proportion = Freq/sum(Freq))
+
+white_no_castle_prop <- did_white %>% filter(castle == FALSE) %>% select(castle, result) %>%
+  table() %>% data.frame() %>% mutate(proportion = Freq/sum(Freq))
+
+white_promote_prop <- did_white %>% filter(promote == TRUE) %>% select(promote, result) %>%
+  table() %>% data.frame() %>% mutate(proportion = Freq/sum(Freq))
+
+white_no_promote_prop <- did_white %>% filter(promote == FALSE) %>% select(promote, result) %>%
+  table() %>% data.frame() %>% mutate(proportion = Freq/sum(Freq))
+
+plot1 <- white_check_prop %>% ggplot(aes(x = fct_infreq(result), fill=result, y = proportion)) +
+  scale_fill_manual(values = c("black", "white")) +
+  geom_bar(stat = "identity") + labs(title = "White delivers check") +
+  ylab("% Games won") + xlab("Victor") + scale_x_discrete(labels = c('Black','White'))+
+  theme(legend.position = "none")
+
+plot2 <- white_no_check_prop %>% ggplot(aes(x = fct_infreq(result), fill=result, y = proportion)) +
+  scale_fill_manual(values = c("black", "white")) +
+  geom_bar(stat = "identity") + labs(title = "White does not deliver check") +
+  ylab("") + xlab("") + scale_x_discrete(labels = c('',''))+
+  theme(legend.position = "none")
+
+plot3 <- white_castle_prop %>% ggplot(aes(x = fct_infreq(result), fill=result, y = proportion)) +
+  scale_fill_manual(values = c("black", "white")) +
+  geom_bar(stat = "identity") + labs(title = "White castles")+
+  ylab("") + xlab("") + scale_x_discrete(labels = c('',''))+
+  theme(legend.position = "none")
+
+plot4 <- white_no_castle_prop %>% ggplot(aes(x = fct_infreq(result), fill=result, y = proportion)) +
+  scale_fill_manual(values = c("black", "white")) +
+  geom_bar(stat = "identity") + labs(title = "White does not castle")+
+  ylab("") + xlab("") + scale_x_discrete(labels = c('',''))+
+  theme(legend.position = "none")
+
+plot5 <- white_promote_prop %>% ggplot(aes(x = fct_infreq(result), fill=result, y = proportion)) +
+  scale_fill_manual(values = c("black", "white")) +
+  geom_bar(stat = "identity") + labs(title = "White promotes")+
+  ylab("") + xlab("") + scale_x_discrete(labels = c('',''))+
+  theme(legend.position = "none")
+
+plot6 <- white_no_promote_prop %>% ggplot(aes(x = fct_infreq(result), fill=result, y = proportion)) +
+  scale_fill_manual(values = c("black", "white")) +
+  geom_bar(stat = "identity") + labs(title = "White does not promote")+
+  ylab("") + xlab("") + scale_x_discrete(labels = c('',''))+
+  theme(legend.position = "none")
+
+grid.arrange(plot1, plot2,
+             plot3, plot4,
+             plot5, plot6, ncol=2)
+```
+
+We observe some interesting results. As expected, delivering check and castling within the first 20 moves produce an average win rate above 50% for white, and in particular produce much better outcomes for white than in games where these moves did not happen.
+
+However, the most dramatic difference lies in whether white promotes within the first 20 moves or not. **White's win rate is essentially 50% if they do not promote within the first 20 moves, but jumps to almost 70% if they do.** This is because relative to delivering check and castling, which are strong but not necessarily crushing moves in their own right, promoting a pawn within the first 20 moves is a difficult feat (you have to move your pawn to the other side of the board, past all the obstacles of the enemy territory!)
+
+Promoting a pawn within the first 20 moves both signals that things have gone very well for white, and provides white with a new major advantage in the form of a promoted piece (most typically a queen, the strongest piece in chess.)
+
+## What are the best popular opening moves for white and black?
+
+We answer this question by again using our grouped two ply vector for all games and, of the 10 most played moves, observing their respective win rates for White.
+
+```{r echo=FALSE}
+two_ply_result <- data.frame(two_ply,data$result)
+first_move_results <- data.frame(table(two_ply_result))
+
+e4_e5 <- (first_move_results %>% filter(two_ply == 'e4 e5') %>% mutate(proportion = Freq/sum(Freq)) %>% filter(data.result == 1))$proportion
+e4_c5 <- (first_move_results %>% filter(two_ply == 'e4 c5') %>% mutate(proportion = Freq/sum(Freq)) %>% filter(data.result == 1))$proportion
+d4_d5 <- (first_move_results %>% filter(two_ply == 'd4 d5') %>% mutate(proportion = Freq/sum(Freq)) %>% filter(data.result == 1))$proportion
+e4_e6 <- (first_move_results %>% filter(two_ply == 'e4 e6') %>% mutate(proportion = Freq/sum(Freq)) %>% filter(data.result == 1))$proportion
+d4_Nf6 <- (first_move_results %>% filter(two_ply == 'd4 Nf6') %>% mutate(proportion = Freq/sum(Freq)) %>% filter(data.result == 1))$proportion
+e4_d5 <- (first_move_results %>% filter(two_ply == 'e4 d5') %>% mutate(proportion = Freq/sum(Freq)) %>% filter(data.result == 1))$proportion
+d4_e6 <- (first_move_results %>% filter(two_ply == 'd4 e6') %>% mutate(proportion = Freq/sum(Freq)) %>% filter(data.result == 1))$proportion
+e4_c6 <- (first_move_results %>% filter(two_ply == 'e4 c6') %>% mutate(proportion = Freq/sum(Freq)) %>% filter(data.result == 1))$proportion
+e4_d6 <- (first_move_results %>% filter(two_ply == 'e4 d6') %>% mutate(proportion = Freq/sum(Freq)) %>% filter(data.result == 1))$proportion
+e4_g6 <- (first_move_results %>% filter(two_ply == 'e4 g6') %>% mutate(proportion = Freq/sum(Freq)) %>% filter(data.result == 1))$proportion
+
+wins_by_first_move <- data.frame(move = c('e4_e5','e4_c5', 'd4_d5', 'e4_e6', 'd4_Nf6',
+                    'e4_d5', 'd4_e6', 'e4_c6', 'e4_d6', 'e4_g6'),
+                    prop = c(e4_e5,e4_c5, d4_d5, e4_e6, d4_Nf6,
+                    e4_d5, d4_e6, e4_c6, e4_d6, e4_g6))
+wins_by_first_move %<>% arrange(desc(prop))
+wins_by_first_move$move %<>% fct_reorder(wins_by_first_move$prop, .desc=TRUE)
+
+wins_by_first_move %>% ggplot(aes(x = move, fill=move, y = prop)) +
+  geom_bar(stat = "identity") +
+  coord_cartesian(ylim=c(.45,.55)) +
+  ylab("Proportion of games won by white") +
+  xlab("Opening move") + 
+  ggtitle("Proportion of games won by white by opening move") # PROPORTION OF GAMES WON BY WHITE BY FIRST MOVE
+```
+
+While, as expected, all of the first full moves hover around a 50% win rate for white, it seems that there exist some relative gaps in understanding from both white and black players in the aggregate for particular moves (in our data set). **White seems to have an edge over black on how to play 1. d4 d5 (The Closed Game) and likewise with black and 1. e4 c5 (The Sicilian Defense), 1. e4 c6 (The Caro-Kann Defense), and 1. d4 Nf6 (The Indian Defence).**
+
+# Model Fitting
+
+## Train-test split and cross validation
+
+To conduct supervised machine learning, we must split the dataset into a training and testing set. Our models will be applied to the training set to discern associations between our predictors (plys 1-40) and the response (result of each game). The testing set will be used to assess the performance of our models on data new and unknown to them.
+
+### Stratified Sampling
+
+We use stratified sampling on the response variable (as opposed to simple random sampling) when dividing our data into two to ensure that one group (those games which are White's victory, or Black's) does not become over or underrepresented in the training or testing data. This means that our models will not become biased toward one result due to arbitrary differences in distribution. We instead want them to embody underlying, systematic patterns of difference in the data.
+
+Due to hardware (memory) limitations, we were unfortunately forced to choose a relatively small proportion of training data. However, we still have 17,305 observations on which to train our models.
+
+```{r}
+set.seed(1337)
+data_split <- initial_split(data, prop = .2, strata = "result")
+data_train <- training(data_split)
+data_test <- testing(data_split)
+```
+
+### k-fold Cross Validation
+
+In addition to the train-test split, we are interested in a method of validating many models before we select a final choice for assessment on new and unknown (testing) data. k-fold cross validation allows us to do this by turning the training set into k 'folds', each of which comprise of a 'mini' training and validation set. We are able to acquire an averaged assessment of performance on validation data, and therefore, a low error estimate of performance on final testing data.
+
+Why are we interested in validation? It allows us to tune our models without forgoing our opportunity to perform a final assessment of performance without bias. If we use simply train our models and test them, then tweak our models based on the result of the testing data, *we will be biasing our models towards the testing data and nullifying the original purpose of the testing data to begin with*.
+
+K-fold cross validation, by averaging the results of many subset validation sets, as opposed to validating with a single set, gives us the lowest error estimates of test performance which we can then use to make an informed decision on selecting a model. We will split the training set into 5 folds here, and stratify on the response just as we did in the initial train-test split.
+
+```{r}
+data_folds <- vfold_cv(data_train, v = 5, strata = "result")
+```
+
+## Model workflows, tuning, and fitting
+
+We will attempt four models: elastic net classification, a random forest, a boosted tree, and a support vector machine.
+
+```{r}
+chess_recipe <- recipe(result ~ ., data=data_train) %>% step_novel() %>% step_dummy(all_nominal_predictors())
+svm_recipe <- recipe(result ~ ., data=data_train)
+```
+
+For classification models, we typically wish to create indicator/dummy variables indicating the presence of a factor in an observation, instead of having the factor itself, so we use step_dummy. However, attempts to apply this recipe to the support vector machine threw a protection stack overflow error. We found that excluding this step allows the support vector machine to compute without issue; it seems that when using fit()-like functions such as fit_resamples(), if the data is factorized, parsnip converts the factor columns to indicators regardless. See <https://parsnip.tidymodels.org/reference/details_svm_linear_kernlab.html> (under Preprocessing requirements)
+
+### Elastic Net Classification
+
+This elastic net classification is founded on logistic regression. Logistic regression uses a logit model to regress the log odds of a binary outcome occurring. Essentially, using only the ply text data it is given, the model is attempting to predict the probability that a game ends in White's victory.
+
+The elastic net is a regularization method applied atop this regression. With cross validation, we are able to try varying degrees of regularization (`penalty`, 0 being no regularization; simply, logistic regression) as well as the degree to which ridge or lasso regression is being used (`mixture`, 0 being only ridge and 1 being only lasso).
+
+What regularization does is desensitize the predicted response to actual differences in the predictors. In machine learning parlance, it introduces a small degree of bias to lower the variance of the model. By adding regularization, we are preventing the model from being overly swayed by what may be arbitrary differences in the training data which do not reflect a systematic component. However, with too much regularization, we remove the predictive power of our features entirely from the model. Therefore, we use cross validation and a grid of varying values for `penalty` in order to find the best combination for the elastic net in terms of estimated test performance.
+
+As a final note, the difference between ridge and lasso regression is that lasso regression can shrink the parameter for a predictor down to 0 entirely while ridge regression cannot. This means that lasso regressions are more suited for models which have some arbitrary parameters that can be eliminated entirely while ridge regressions are suited for models where all parameters serve some importance. Since this determination is not entirely obvious, especially in this context, we use varying degrees of `mixture` to again find the best suited combination in terms of estimated test performance.
+
+```{r}
+en <- logistic_reg(mixture = tune(),
+                   penalty = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+en_wf <- workflow() %>% add_model(en) %>% add_recipe(chess_recipe)
+
+en_grid <- grid_regular(penalty(range = c(0, 1),
+                                trans = identity_trans()),
+                        mixture(range = c(0, 1)),
+                        levels = 5)
+```
+
+### Random Forest
+
+The random forest is built on decision trees. Decision trees use the relative ability of individual predictors to best split the data into two groups with as different outcome as possible. They are built in order from the most seperative predictors to the least seperative predictors. Once a decision tree is built, to predict the outcome of a new observation is as simple as following the tree down through the nodes and assigning it to the predictor space it belongs. Here that means "Was e4 played on ply_1? Was Nf3 played on ply_5?" and so on.
+
+The random forest reduces the estimated test error dramatically by averaging the results of many decision trees, which use bootstrapped (resampled and slightly differing) datasets. Another key feature is that each tree in the random forest has only a subset of predictors to choose from at each node. The size of this subset is a hyperparameter (model parameter which is determined by the person creating the model) known as `mtry`. Like with `mixture` and `penalty` from the elastic next model, we will be tuning this as well as `min_n`, or the minimum number of observations which can belong in the terminal nodes of the tree (the stopping point for the depth of the tree.) If `min_n` is too small, the model may not be able to make good predictions, because it does not have a large enough sample from which to make a convincing next determination of difference between two groups.
+
+Our hyperparameter ranges are 50-250 for `mtry`, 10-1000 for `min_n`, and simply 200 for `trees`. These ranges were intended to capture a realistic yet wide set of optimal choices given the large number of dummy predictors. Trees was not given a range as beyond a certain number, it is known that estimated test performance is not greatly affected.
+
+```{r}
+rf <- rand_forest(mtry = tune(),
+                  trees = 200,
+                  min_n = tune()) %>%
+  set_engine("ranger", importance = 'impurity') %>% 
+  set_mode("classification")
+
+rf_wf <- workflow() %>% add_model(rf) %>% add_recipe(chess_recipe)
+
+rf_grid <- grid_regular(mtry(range = c(50, 250)), 
+                        min_n(range = c(10, 1000)),
+                        levels = 5)
+```
+
+### Boosted Tree
+
+Whereas the random forest aggregates the results of many different decision trees, the gradient-boosted tree builds on one tree vertically. Each addition to the gradient-boosted tree attempts to predict the residuals between the observed and predicted probability predictions of the aggregate tree before it. Then, that tree is added to the overall tree, albeit scaled down by a `learn_rate` which prevents the overall tree from overfitting on each iteration.
+
+Here we have once again chosen 200 `trees`, `mtry` from a range of 50 to 250, and a `learn_rate` from $10^{-10}$ to 0.1.
+
+```{r}
+bt <- boost_tree(mtry = tune(),
+                 trees = 200,
+                 learn_rate = tune()) %>%
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+bt_wf <- workflow() %>% add_model(bt) %>% add_recipe(chess_recipe)
+
+bt_grid <- grid_regular(mtry(range = c(50, 250)),
+                        learn_rate(range = c(-10, -1)),
+                        levels = 5)
+
+```
+
+### Support Vector Machine
+
+The support vector machine finds an optimal hyperplane which, allowing for some misclassification, best separates the response into classes. In our particular case, we are trying a linear kernel and tuning `cost`. `cost` is the level of misclassification we allow the SVM when finding an optimal hyperplane.
+
+```{r}
+svm <- svm_poly(degree = 1, cost = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("kernlab")
+
+svm_wf <- workflow() %>% 
+  add_recipe(svm_recipe) %>% 
+  add_model(svm)
+
+svm_grid <- grid_regular(cost(), levels = 5)
+```
+
+In the interest of saving time (to tune these models within the knit of this document would not be feasible), the models were tuned in the complementary document 'tune.R' and their results were saved as `tune_en`, `tune_rf`, `tune_bt`, and `tune_svm`. They will be loaded in directly for the following sections.
+
+## Model Selection
+
+### Elastic Net Performance on Validation Data
+
+```{r}
+tune_en <- read_rds(file="tune_en.rds")
+tune_rf <- read_rds(file="tune_rf.rds")
+tune_bt <- read_rds(file="tune_bt.rds")
+tune_svm <- read_rds(file="tune_svm.rds")
+
+autoplot(tune_en)
+```
+
+Our plot shows us that `roc_auc` (the metric we are interested in, which will be explained later) increased as `penalty` increased when we had complete ridge regression. It's difficult to see, but it appears that **any** amount of lasso regression quickly lowers the model's performance to .5 `roc_auc`, a model which is no better than random chance.
+
+Our best model from this set, a ridge regression with a `penalty` of 1 isn't anything to write home about either, though. It has .57 `roc_auc.`
+
+Recalling what situations lasso and ridge regression are each suited for, this would seem to imply that none of the plys are arbitrary to the point of deserving exclusion as a predictor, which makes sense intuitively. Any amount of lasso regression makes this a worse model.
+
+### Random Forest Performance
+
+```{r}
+autoplot(tune_rf)
+```
+
+This plot shows us that `roc_auc` decreased as `m_try` increased. There does not appear to be a convincing relationship between `min_n` and `roc_auc` though, save maybe that a minimal node size of 10 is probably too small.
+
+We see slightly better results compared to our elastic net. It looks like our best model achieved close to .58 `roc_auc.`
+
+### Boosted Tree Performance
+
+```{r}
+autoplot(tune_bt)
+```
+
+It doesn't appear that within the range we selected, increasing `m_try` had an effect on `roc_auc`. The most stark differences re between the learning rates. It appears that larger learning rates performed better than smaller ones, before leveling off around .55 `roc_auc`.
+
+### SVM Performance
+
+```{r}
+autoplot(tune_svm)
+```
+
+None of the choices for `cost` within the range we selected produced a very accurate model.
+
+### The Best Model
+
+```{r}
+show_best(tune_en, n=1, metric='roc_auc')
+```
+
+```{r}
+show_best(tune_rf, n=1, metric='roc_auc')
+```
+
+```{r}
+show_best(tune_bt, n=1, metric='roc_auc')
+```
+
+```{r}
+show_best(tune_svm, n=1, metric='roc_auc')
+```
+
+We will designate our **Random Forest model with `mtry`=50 and `min_n`=752 as our best model** because it has the largest Area under the Receiving Operator Characteristic curve, or `roc_auc` (with low standard error). The `roc_auc` gives us a measure of the classifier's ability to both consistently and correctly predict the outcome for some class, while avoiding predicting the same outcome for the wrong class. In other words, the true positive rate and false positive rate of the classifier at all classification thresholds. We want a classifier which has very high true positive rate and low false positive rate. The `roc_auc` is a better metric of performance than raw accuracy, which can mislead us because it does not consider false positive rate. Therefore, is is an appropriate criterion for selecting our model.
+
+# Final Model Assessment
+
+```{r}
+best_rf <- select_best(tune_rf, metric='roc_auc')
+
+final_wf <- finalize_workflow(rf_wf, best_rf)
+# final_fit <- fit(final_wf, data_train)
+
+# write_rds(final_fit, file="final_fit.rds")
+final_fit <- read_rds(file="final_fit.rds")
+```
+
+```{r}
+augment(final_fit, data_test) %>% roc_auc(truth = result, .pred_0)
+```
+
+Our selected model actually performed a little better on the testing data than it did the training data, with an `roc_auc` of .59.
+
+```{r}
+roc_curve(augment(final_fit, data_test), truth = result, .pred_0) %>% autoplot()
+```
+
+This is a plot of the ROC curve. A fuller curve which stretches towards the top left corner (closer to an `roc_auc` of 1) is indicative of a model which is better at both classifying positive outcomes correctly and avoiding misclassifying negative outcomes as positive ones.
+
+```{r}
+conf_mat(augment(final_fit, data_test), truth = result, .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+
+This is a 'confusion matrix' of the classified outcomes. Remember, 0 represents a win for Black and 1 represents a win for White. The matrix tells us that the model classified 16,226 wins for Black and 22,460 wins for White correctly, but also misclassified 17,929 wins for Black as White wins, and misclassified 12,608 wins for White as wins for Black.
+
+# Conclusion
+
+Overall, we did not end up with a particularly useful model. It performs only slightly better than random chance at predicting the outcome of chess games. All other models are comparable in performance, with SVM performing the worst.
+
+However, provided that the model was given only text data which was almost entirely raw and unprocessed, it is interesting and surprising that it was still able to extract enough useful patterns to be a better classifier than random chance. The model's performance may not be substantial, but it is significant. I consider the project a success in that regard.
+
+In addition, the size of our training dataset was limited by memory constraints. It is quite likely the model would have performed even better were it given access to the full dataset.
+
+I felt from the start that this was a challenging prospect for these machine learning methods, given the unique structure of the data. There was an intuitive mismatch between it and the kinds of data for which these methods would typically be employed, where each column is more of an independent entity. Nonetheless, that was the point of the project to begin with; to see what sort of predictive power remained regardless.
+
+In the future, it would be interesting to challenge the problem more earnestly and explore more complex models and approaches, possibly through utilizing neural networks and natural language processing.

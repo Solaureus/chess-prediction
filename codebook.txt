@@ -1,0 +1,7 @@
+ply_1-40: The "move" being played by the white or black player at that point in the game. Odd plys are white's move, even plys are black's move.
+	For example:
+		ply_1: "e4" White moves pawn to e4 on the very first ply of the game.
+		ply_2: "e5" Black moves pawn to e5 on the second ply of the game, completing the first "full move" of the game.
+		ply_3: "Nf3" White moves knight to f3 on the third ply of the game.
+	And so on.
+result: Bivariate result of the game played. 1 represents White's victory, 0 represents Black's victory.
